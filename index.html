@@ -1,0 +1,205 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <title>Microsoft Symbol Downloader</title>
+  <style>
+    body {
+      font-family: Arial, Helvetica, sans-serif;
+      max-width: 640px;
+      margin: 40px auto;
+      padding: 0 20px;
+    }
+
+    #drop {
+      border: 2px dashed #888888;
+      border-radius: 10px;
+      padding: 50px 20px;
+      text-align: center;
+      color: #555555;
+      cursor: pointer;
+    }
+
+    #drop.over {
+      border-color: #296dff;
+      background: #f4f7ff;
+    }
+
+    #out {
+      margin-top: 20px;
+    }
+
+    .pdb {
+      font-weight: bold;
+      margin-top: 16px;
+      word-break: break-all;
+    }
+
+    .dl {
+      display: inline-block;
+      margin-top: 6px;
+      color: #296dff;
+    }
+
+    .err {
+      color: #c00000;
+      margin-top: 16px;
+    }
+  </style>
+</head>
+<body>
+  <h2>Microsoft Symbol Downloader</h2>
+
+  <div id="drop">Drag and drop a file here (or click to browse)</div>
+  <input type="file" id="file" hidden multiple>
+  <div id="out"></div>
+
+  <script type="module">
+    import * as PE from 'https://cdn.jsdelivr.net/npm/pe-library@1/+esm';
+
+    const dropZone = document.getElementById('drop');
+    const fileInput = document.getElementById('file');
+    const output = document.getElementById('out');
+
+    dropZone.onclick = () => fileInput.click();
+    fileInput.onchange = e => {
+      return [...e.target.files].forEach(handleFile);
+    };
+
+    ['dragenter', 'dragover'].forEach(name => dropZone.addEventListener(name, e => {
+      e.preventDefault();
+      dropZone.classList.add('over');
+    }));
+
+    ['dragleave', 'drop'].forEach(name => dropZone.addEventListener(name, e => {
+      e.preventDefault();
+      dropZone.classList.remove('over');
+    }));
+
+    dropZone.addEventListener('drop', e => {
+      return [...e.dataTransfer.files].forEach(handleFile)
+    });
+
+    function handleFile(file) {
+      const reader = new FileReader();
+      reader.onload = () => {
+        try {
+          showResult(getPdbInfo(reader.result));
+        } catch (error) {
+          output.innerHTML += `<div class="err">${file.name}: ${error.message}</div>`;
+        }
+      };
+      reader.readAsArrayBuffer(file);
+    }
+
+    function showResult(pdbInfo) {
+      const container = document.createElement('div');
+      container.innerHTML =
+        `<div class="pdb">${pdbInfo.pdbName}</div>` +
+        `<a class="dl" href="${pdbInfo.symbolUrl}" download="${pdbInfo.pdbName}">Download PDB</a>`;
+      output.prepend(container);
+    }
+
+    function getPdbInfo(fileBuffer) {
+      const executable = PE.NtExecutable.from(fileBuffer);
+      const debugDirectory = executable.newHeader.optionalHeaderDataDirectory.get(PE.Format.ImageDirectoryEntry.Debug);
+      if (!debugDirectory || !debugDirectory.size) {
+        throw new Error('no debug info');
+      }
+
+      const sections = executable.getAllSections();
+      const readAtRva = rva => {
+        for (const section of sections) {
+          const sectionStart = section.info.virtualAddress;
+          const sectionSize = Math.max(section.info.virtualSize, section.info.sizeOfRawData);
+          if (section.data && rva >= sectionStart && rva < sectionStart + sectionSize) {
+            const offset = rva - sectionStart;
+            if (offset < section.data.byteLength) {
+              return {
+                view: new DataView(section.data),
+                offset
+              };
+            }
+          }
+        }
+        return null;
+      };
+
+      const debugEntries = readAtRva(debugDirectory.virtualAddress);
+      if (!debugEntries) {
+        throw new Error('cannot locate debug directory');
+      }
+
+      const entryCount = Math.floor(debugDirectory.size / 28);
+      for (let i = 0; i < entryCount; i++) {
+        const entryOffset = debugEntries.offset + i * 28;
+        if (debugEntries.view.getUint32(entryOffset + 12, true) !== 2) { // IMAGE_DEBUG_TYPE_CODEVIEW
+          continue;
+        }
+
+        const codeView = readAtRva(debugEntries.view.getUint32(entryOffset + 20, true)); // AddressOfRawData
+        if (!codeView) {
+          throw new Error('cannot locate CodeView data');
+        }
+
+        return parseCodeView(codeView.view, codeView.offset);
+      }
+
+      throw new Error('no pdb debug entry');
+    }
+
+    function toHex(value, width) {
+      return value.toString(16).padStart(width, '0');
+    }
+
+    function parseCodeView(view, offset) {
+      const signature = String.fromCharCode(
+        view.getUint8(offset),
+        view.getUint8(offset + 1),
+        view.getUint8(offset + 2),
+        view.getUint8(offset + 3)
+      );
+
+      if (signature !== 'RSDS') {
+        throw new Error('Unsupported debug format');
+      }
+
+      const guidPart1 = view.getUint32(offset + 4, true);
+      const guidPart2 = view.getUint16(offset + 8, true);
+      const guidPart3 = view.getUint16(offset + 10, true);
+
+      let guidPart4 = '';
+      for (let i = 0; i < 8; i++) {
+        guidPart4 += toHex(view.getUint8(offset + 12 + i), 2);
+      }
+
+      const age = view.getUint32(offset + 20, true);
+
+      let cursor = offset + 24, pathBytes = [];
+      while (cursor < view.byteLength) {
+        const byte = view.getUint8(cursor++);
+        if (byte === 0) {
+          break;
+        }
+        pathBytes.push(byte);
+      }
+
+      const pdbName = new TextDecoder()
+        .decode(new Uint8Array(pathBytes))
+        .split(/[\\/]/)
+        .pop();
+
+      const guid = (toHex(guidPart1, 8)
+        + toHex(guidPart2, 4)
+        + toHex(guidPart3, 4)
+        + guidPart4).toUpperCase();
+
+      const symbolId = guid + age.toString(16).toUpperCase();
+
+      return {
+        pdbName,
+        symbolUrl: `https://msdl.microsoft.com/download/symbols/${encodeURIComponent(pdbName)}/${symbolId}/${encodeURIComponent(pdbName)}`
+      };
+    }
+  </script>
+</body>
+</html>
